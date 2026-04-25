@@ -192,152 +192,185 @@ parse_timing() {
         return 1
     fi
 
-    echo "$timing" | awk -v freq="$FREQ" '
-    function new_round() {
-        flush_round()
-        round++
-        min_start = 0; max_end = 0
-        min_sched_start = 0; max_sched_end = 0
-        min_orch_start = 0; max_orch_end = 0
-        delete sched_seen
-        delete orch_seen
-    }
-    function flush_round() {
-        if (round >= 0 && max_end > 0 && min_start > 0) {
-            results[round] = (max_end - min_start) / freq
-            if (max_sched_end > 0 && min_sched_start > 0)
-                sched_results[round] = (max_sched_end - min_sched_start) / freq
-            if (max_orch_end > 0 && min_orch_start > 0)
-                orch_results[round] = (max_orch_end - min_orch_start) / freq
-            count++
-        }
-    }
-    BEGIN {
-        round = 0; count = 0
-        min_start = 0; max_end = 0
-        min_sched_start = 0; max_sched_end = 0
-        min_orch_start = 0; max_orch_end = 0
-        has_sched = 0; has_orch_end = 0
-    }
-    /sched_start=/ {
-        match($0, /Thread ([0-9]+):/, tm)
-        tid = tm[1] + 0
-        if (tid in sched_seen) new_round()
-        sched_seen[tid] = 1
-        has_sched = 1
-        match($0, /sched_start=([0-9]+)/, m)
-        val = m[1] + 0
-        if (min_sched_start == 0 || val < min_sched_start) min_sched_start = val
-        if (min_start == 0 || val < min_start) min_start = val
-    }
-    /orch_start=/ {
-        match($0, /Thread ([0-9]+):/, tm)
-        tid = tm[1] + 0
-        if (tid in orch_seen) new_round()
-        orch_seen[tid] = 1
-        match($0, /orch_start=([0-9]+)/, m)
-        val = m[1] + 0
-        if (min_orch_start == 0 || val < min_orch_start) min_orch_start = val
-        if (min_start == 0 || val < min_start) min_start = val
-    }
-    /sched_end[^=]*=/ {
-        match($0, /sched_end[^=]*=([0-9]+)/, m)
-        val = m[1] + 0
-        if (val > max_sched_end) max_sched_end = val
-        if (val > max_end) max_end = val
-    }
-    /orch_end=/ {
-        match($0, /orch_end=([0-9]+)/, m)
-        val = m[1] + 0
-        has_orch_end = 1
-        if (val > max_orch_end) max_orch_end = val
-        if (val > max_end) max_end = val
-    }
-    /orch_stage_end=/ {
-        match($0, /orch_stage_end=([0-9]+)/, m)
-        val = m[1] + 0
-        if (val > max_end) max_end = val
-    }
-    END {
-        flush_round()
-        if (count == 0) { print "  (no rounds parsed)"; exit 1 }
+    # NOTE: Use python instead of awk because common awk implementations on
+    # hosts (e.g. mawk) don't support gawk-only `match(..., ..., array)` APIs.
+    python3 - "$FREQ" "$log_file" <<'PY'
+import re
+import sys
 
-        show_sched = has_sched
-        show_orch = has_orch_end
+freq = float(sys.argv[1])
+log_file = sys.argv[2]
 
-        # Header
-        hdr = sprintf("  %-8s  %12s", "Round", "Elapsed (us)")
-        sep = sprintf("  %-8s  %12s", "-----", "------------")
-        if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)"); sep = sep sprintf("  %12s", "----------") }
-        if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");  sep = sep sprintf("  %12s", "---------")  }
-        print hdr; print sep
+with open(log_file, "r", errors="ignore") as f:
+    timing = [
+        line.rstrip("\n")
+        for line in f
+        if re.search(r"Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)", line)
+    ]
 
-        sum_v = 0; min_v = results[0]; max_v = results[0]
-        sum_s = 0; min_s = sched_results[0]; max_s = sched_results[0]
-        sum_o = 0; min_o = orch_results[0]; max_o = orch_results[0]
+re_tid = re.compile(r"Thread ([0-9]+):")
+re_sched_start = re.compile(r"sched_start=([0-9]+)")
+re_sched_end = re.compile(r"sched_end[^=]*=([0-9]+)")
+re_orch_start = re.compile(r"orch_start=([0-9]+)")
+re_orch_end = re.compile(r"orch_end=([0-9]+)")
+re_orch_stage_end = re.compile(r"orch_stage_end=([0-9]+)")
 
-        for (i = 0; i < count; i++) {
-            line = sprintf("  %-8d  %12.1f", i, results[i])
-            sum_v += results[i]
-            if (results[i] < min_v) min_v = results[i]
-            if (results[i] > max_v) max_v = results[i]
-            if (show_sched) {
-                line = line sprintf("  %12.1f", sched_results[i])
-                sum_s += sched_results[i]
-                if (sched_results[i] < min_s) min_s = sched_results[i]
-                if (sched_results[i] > max_s) max_s = sched_results[i]
-            }
-            if (show_orch) {
-                line = line sprintf("  %12.1f", orch_results[i])
-                sum_o += orch_results[i]
-                if (orch_results[i] < min_o) min_o = orch_results[i]
-                if (orch_results[i] > max_o) max_o = orch_results[i]
-            }
-            print line
-        }
 
-        printf "\n  Avg: %.1f us", sum_v / count
-        if (show_sched) printf "  |  Sched Avg: %.1f us", sum_s / count
-        if (show_orch)  printf "  |  Orch Avg: %.1f us", sum_o / count
-        printf "  (%d rounds)\n", count
+def flush_round(round_idx, state, out):
+    if state["min_start"] and state["max_end"] and state["max_end"] > state["min_start"]:
+        out["elapsed"].append((state["max_end"] - state["min_start"]) / freq)
+        if state["min_sched_start"] and state["max_sched_end"] and state["max_sched_end"] > state["min_sched_start"]:
+            out["sched"].append((state["max_sched_end"] - state["min_sched_start"]) / freq)
+        else:
+            out["sched"].append(None)
+        if state["min_orch_start"] and state["max_orch_end"] and state["max_orch_end"] > state["min_orch_start"]:
+            out["orch"].append((state["max_orch_end"] - state["min_orch_start"]) / freq)
+        else:
+            out["orch"].append(None)
+        return round_idx + 1
+    return round_idx
 
-        TRIM = 10
-        if (count > 2 * TRIM) {
-            # Insertion sort for each metric
-            for (i = 0; i < count; i++) sv[i] = results[i]
-            for (i = 1; i < count; i++) {
-                k = sv[i]; j = i - 1
-                while (j >= 0 && sv[j] > k) { sv[j+1] = sv[j]; j-- }
-                sv[j+1] = k
-            }
-            tc = count - 2 * TRIM; ts = 0
-            for (i = TRIM; i < count - TRIM; i++) ts += sv[i]
-            printf "  Trimmed Avg: %.1f us  (dropped %d low + %d high, %d rounds used)\n", ts / tc, TRIM, TRIM, tc
 
-            if (show_sched) {
-                for (i = 0; i < count; i++) ss[i] = sched_results[i]
-                for (i = 1; i < count; i++) {
-                    k = ss[i]; j = i - 1
-                    while (j >= 0 && ss[j] > k) { ss[j+1] = ss[j]; j-- }
-                    ss[j+1] = k
-                }
-                ts2 = 0
-                for (i = TRIM; i < count - TRIM; i++) ts2 += ss[i]
-                printf "  Sched Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts2 / tc, TRIM, TRIM
-            }
-            if (show_orch) {
-                for (i = 0; i < count; i++) so[i] = orch_results[i]
-                for (i = 1; i < count; i++) {
-                    k = so[i]; j = i - 1
-                    while (j >= 0 && so[j] > k) { so[j+1] = so[j]; j-- }
-                    so[j+1] = k
-                }
-                ts3 = 0
-                for (i = TRIM; i < count - TRIM; i++) ts3 += so[i]
-                printf "  Orch Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts3 / tc, TRIM, TRIM
-            }
-        }
-    }'
+def new_state():
+    return {
+        "min_start": 0,
+        "max_end": 0,
+        "min_sched_start": 0,
+        "max_sched_end": 0,
+        "min_orch_start": 0,
+        "max_orch_end": 0,
+        "sched_seen": set(),
+        "orch_seen": set(),
+        "has_sched": False,
+        "has_orch_end": False,
+    }
+
+
+state = new_state()
+out = {"elapsed": [], "sched": [], "orch": []}
+round_idx = 0
+
+for line in timing:
+    m = re_tid.search(line)
+    tid = int(m.group(1)) if m else None
+
+    ms = re_sched_start.search(line)
+    if ms:
+        if tid is not None and tid in state["sched_seen"]:
+            round_idx = flush_round(round_idx, state, out)
+            state = new_state()
+        if tid is not None:
+            state["sched_seen"].add(tid)
+        state["has_sched"] = True
+        val = int(ms.group(1))
+        state["min_sched_start"] = val if state["min_sched_start"] == 0 else min(state["min_sched_start"], val)
+        state["min_start"] = val if state["min_start"] == 0 else min(state["min_start"], val)
+
+    mo = re_orch_start.search(line)
+    if mo:
+        if tid is not None and tid in state["orch_seen"]:
+            round_idx = flush_round(round_idx, state, out)
+            state = new_state()
+        if tid is not None:
+            state["orch_seen"].add(tid)
+        val = int(mo.group(1))
+        state["min_orch_start"] = val if state["min_orch_start"] == 0 else min(state["min_orch_start"], val)
+        state["min_start"] = val if state["min_start"] == 0 else min(state["min_start"], val)
+
+    me = re_sched_end.search(line)
+    if me:
+        val = int(me.group(1))
+        state["max_sched_end"] = max(state["max_sched_end"], val)
+        state["max_end"] = max(state["max_end"], val)
+
+    moe = re_orch_end.search(line)
+    if moe:
+        val = int(moe.group(1))
+        state["has_orch_end"] = True
+        state["max_orch_end"] = max(state["max_orch_end"], val)
+        state["max_end"] = max(state["max_end"], val)
+
+    mse = re_orch_stage_end.search(line)
+    if mse:
+        val = int(mse.group(1))
+        state["max_end"] = max(state["max_end"], val)
+
+round_idx = flush_round(round_idx, state, out)
+
+count = len(out["elapsed"])
+if count == 0:
+    print("  (no rounds parsed)")
+    raise SystemExit(1)
+
+show_sched = any(v is not None for v in out["sched"])
+show_orch = any(v is not None for v in out["orch"])
+
+hdr = f"  {'Round':<8}  {'Elapsed (us)':>12}"
+sep = f"  {'-----':<8}  {'------------':>12}"
+if show_sched:
+    hdr += f"  {'Sched (us)':>12}"
+    sep += f"  {'----------':>12}"
+if show_orch:
+    hdr += f"  {'Orch (us)':>12}"
+    sep += f"  {'---------':>12}"
+print(hdr)
+print(sep)
+
+def fmt(v):
+    return f"{v:12.1f}" if v is not None else f"{'-':>12}"
+
+sum_e = 0.0
+sum_s = 0.0
+sum_o = 0.0
+cnt_s = 0
+cnt_o = 0
+
+for i in range(count):
+    e = out["elapsed"][i]
+    s = out["sched"][i]
+    o = out["orch"][i]
+    line = f"  {i:<8d}  {e:12.1f}"
+    sum_e += e
+    if show_sched:
+        line += "  " + fmt(s)
+        if s is not None:
+            sum_s += s
+            cnt_s += 1
+    if show_orch:
+        line += "  " + fmt(o)
+        if o is not None:
+            sum_o += o
+            cnt_o += 1
+    print(line)
+
+avg_e = sum_e / count
+msg = f"\n  Avg: {avg_e:.1f} us"
+if show_sched:
+    msg += f"  |  Sched Avg: {(sum_s / max(cnt_s,1)):.1f} us"
+if show_orch:
+    msg += f"  |  Orch Avg: {(sum_o / max(cnt_o,1)):.1f} us"
+msg += f"  ({count} rounds)"
+print(msg)
+
+TRIM = 10
+if count > 2 * TRIM:
+    sv = sorted(out["elapsed"])
+    trimmed = sv[TRIM:count-TRIM]
+    tavg = sum(trimmed) / len(trimmed)
+    print(f"  Trimmed Avg: {tavg:.1f} us  (dropped {TRIM} low + {TRIM} high, {len(trimmed)} rounds used)")
+    if show_sched:
+        ss = [v for v in out['sched'] if v is not None]
+        if len(ss) > 2 * TRIM:
+            ss.sort()
+            tss = ss[TRIM:len(ss)-TRIM]
+            print(f"  Sched Trimmed Avg: {sum(tss)/len(tss):.1f} us  (dropped {TRIM} low + {TRIM} high)")
+    if show_orch:
+        so = [v for v in out['orch'] if v is not None]
+        if len(so) > 2 * TRIM:
+            so.sort()
+            tso = so[TRIM:len(so)-TRIM]
+            print(f"  Orch Trimmed Avg: {sum(tso)/len(tso):.1f} us  (dropped {TRIM} low + {TRIM} high)")
+PY
 }
 
 # ---------------------------------------------------------------------------
