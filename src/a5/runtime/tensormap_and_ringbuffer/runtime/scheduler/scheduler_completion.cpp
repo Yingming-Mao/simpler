@@ -256,7 +256,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 // Pending slot promoted to running: treat as a local "pending hit".
                 int32_t type_idx =
                     (bit_pos % 3 == 0) ? SchedulerContext::TWOSLOT_TYPE_AIC : SchedulerContext::TWOSLOT_TYPE_AIV;
-                twoslot_policy_.on_pending_hit(type_idx);
+                twoslot_policy_.on_pending_promote(type_idx);
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
@@ -278,7 +278,7 @@ void SchedulerContext::check_running_cores_for_completion(
 
             // "Miss" accounting: core became idle without a pending promotion while
             // the ready queues still have surplus work (steady fallback zone).
-            if (t.running_done) {
+            if (t.running_done && !t.pending_done) {
                 uint64_t q_aic = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size();
                 uint64_t q_aiv = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV)].size();
                 uint64_t q_mix = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size();
@@ -289,6 +289,7 @@ void SchedulerContext::check_running_cores_for_completion(
                     : 0;
                 int32_t type_idx =
                     (bit_pos % 3 == 0) ? SchedulerContext::TWOSLOT_TYPE_AIC : SchedulerContext::TWOSLOT_TYPE_AIV;
+                twoslot_policy_.on_idle_without_pending(type_idx);
                 twoslot_policy_.on_pending_miss(type_idx, ready_depth, visible);
             }
         } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {

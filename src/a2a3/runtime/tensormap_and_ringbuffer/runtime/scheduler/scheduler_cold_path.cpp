@@ -349,6 +349,29 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         }
     }
 #endif
+    if (thread_idx == 0) {
+        auto load_shape = [this](PTO2ResourceShape shape, auto &counters) {
+            return static_cast<uint64_t>(counters[static_cast<int32_t>(shape)].load(std::memory_order_relaxed));
+        };
+        auto load_type = [](auto &counters, int32_t type_idx) {
+            return static_cast<uint64_t>(counters[type_idx].load(std::memory_order_relaxed));
+        };
+        DEV_ALWAYS(
+            "Thread %d: twoslot diag: dispatch[AIC=%" PRIu64 ",AIV=%" PRIu64 ",MIX=%" PRIu64
+            "] blocked[AIC=%" PRIu64 ",AIV=%" PRIu64 ",MIX=%" PRIu64 "] promote[AIC=%" PRIu64
+            ",AIV=%" PRIu64 "] idle_no_pending[AIC=%" PRIu64 ",AIV=%" PRIu64 "]",
+            thread_idx, load_shape(PTO2ResourceShape::AIC, twoslot_policy_.pending_dispatch_by_shape),
+            load_shape(PTO2ResourceShape::AIV, twoslot_policy_.pending_dispatch_by_shape),
+            load_shape(PTO2ResourceShape::MIX, twoslot_policy_.pending_dispatch_by_shape),
+            load_shape(PTO2ResourceShape::AIC, twoslot_policy_.pending_blocked_by_shape),
+            load_shape(PTO2ResourceShape::AIV, twoslot_policy_.pending_blocked_by_shape),
+            load_shape(PTO2ResourceShape::MIX, twoslot_policy_.pending_blocked_by_shape),
+            load_type(twoslot_policy_.pending_promote_by_type, TWOSLOT_TYPE_AIC),
+            load_type(twoslot_policy_.pending_promote_by_type, TWOSLOT_TYPE_AIV),
+            load_type(twoslot_policy_.idle_without_pending_by_type, TWOSLOT_TYPE_AIC),
+            load_type(twoslot_policy_.idle_without_pending_by_type, TWOSLOT_TYPE_AIV)
+        );
+    }
     DEV_ALWAYS(
         "Thread %d: Scheduler summary: total_time=%.3fus, loops=%" PRIu64 ", tasks_scheduled=%d", thread_idx,
         cycles_to_us(sched_total), static_cast<uint64_t>(l2_perf.sched_loop_count), cur_thread_completed

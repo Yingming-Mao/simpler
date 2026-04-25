@@ -102,8 +102,8 @@ void SchedulerContext::build_payload(
 }
 
 void SchedulerContext::dispatch_subtask_to_core(
-    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    bool to_pending
+    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
+    PTO2ResourceShape shape, PTO2SubtaskSlot subslot, bool to_pending
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -129,6 +129,7 @@ void SchedulerContext::dispatch_subtask_to_core(
     build_payload(payload, slot_state, subslot);
 
     if (to_pending) {
+        twoslot_policy_.on_pending_dispatch(shape);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -161,21 +162,24 @@ void SchedulerContext::dispatch_mix_block_to_cluster(
     if (core_mask & PTO2_SUBTASK_MASK_AIC) {
         bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
+            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2ResourceShape::MIX,
+            PTO2SubtaskSlot::AIC,
             aic_to_pending
         );
     }
     if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
         bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
+            runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2ResourceShape::MIX,
+            PTO2SubtaskSlot::AIV0,
             aiv0_to_pending
         );
     }
     if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
         bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
+            runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2ResourceShape::MIX,
+            PTO2SubtaskSlot::AIV1,
             aiv1_to_pending
         );
     }
@@ -201,9 +205,13 @@ void SchedulerContext::dispatch_block(
     if (shape == PTO2ResourceShape::MIX) {
         dispatch_mix_block_to_cluster(runtime, thread_idx, core_offset, slot_state, to_pending);
     } else if (shape == PTO2ResourceShape::AIC) {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending);
+        dispatch_subtask_to_core(
+            runtime, thread_idx, core_offset, slot_state, shape, PTO2SubtaskSlot::AIC, to_pending
+        );
     } else {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
+        dispatch_subtask_to_core(
+            runtime, thread_idx, core_offset, slot_state, shape, PTO2SubtaskSlot::AIV0, to_pending
+        );
     }
 #if PTO2_PROFILING
     sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(pto2_core_mask(slot_state.active_mask));
@@ -477,6 +485,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
                 if (phase == CoreTracker::DispatchPhase::PENDING &&
                     !twoslot_policy_.allow_pending_shape(shape, ready_aic, ready_aiv, visible_tasks)) {
+                    uint64_t q_shape = 0;
+                    if (shape == PTO2ResourceShape::AIC) {
+                        q_shape = q_aic;
+                    } else if (shape == PTO2ResourceShape::AIV) {
+                        q_shape = q_aiv;
+                    } else {
+                        q_shape = q_mix;
+                    }
+                    if (q_shape > 0) {
+                        auto blocked_cores = tracker.get_dispatchable_cores(shape, phase);
+                        twoslot_policy_.on_pending_blocked(shape, blocked_cores.count());
+                    }
                     continue;
                 }
                 dispatch_shape(

@@ -134,11 +134,21 @@ private:
         // State (shared across scheduler threads)
         std::atomic<int32_t> cooldown[TWOSLOT_TYPE_NUM]{{0}, {0}};
         std::atomic<int32_t> recent_miss_score[TWOSLOT_TYPE_NUM]{{0}, {0}};
+        std::atomic<uint64_t> pending_dispatch_by_shape[PTO2_NUM_RESOURCE_SHAPES]{{0}, {0}, {0}};
+        std::atomic<uint64_t> pending_blocked_by_shape[PTO2_NUM_RESOURCE_SHAPES]{{0}, {0}, {0}};
+        std::atomic<uint64_t> pending_promote_by_type[TWOSLOT_TYPE_NUM]{{0}, {0}};
+        std::atomic<uint64_t> idle_without_pending_by_type[TWOSLOT_TYPE_NUM]{{0}, {0}};
 
         void reset_runtime_state() {
             for (int i = 0; i < TWOSLOT_TYPE_NUM; i++) {
                 cooldown[i].store(0, std::memory_order_relaxed);
                 recent_miss_score[i].store(0, std::memory_order_relaxed);
+                pending_promote_by_type[i].store(0, std::memory_order_relaxed);
+                idle_without_pending_by_type[i].store(0, std::memory_order_relaxed);
+            }
+            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+                pending_dispatch_by_shape[i].store(0, std::memory_order_relaxed);
+                pending_blocked_by_shape[i].store(0, std::memory_order_relaxed);
             }
         }
 
@@ -178,6 +188,24 @@ private:
             if (!recent_negative_enabled) return;
             int32_t s = recent_miss_score[type_idx].load(std::memory_order_relaxed);
             if (s > 0) recent_miss_score[type_idx].store(s - 1, std::memory_order_relaxed);
+        }
+
+        void on_pending_dispatch(PTO2ResourceShape shape) {
+            pending_dispatch_by_shape[static_cast<int32_t>(shape)].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void on_pending_blocked(PTO2ResourceShape shape, int32_t blocked_count) {
+            if (blocked_count <= 0) return;
+            pending_blocked_by_shape[static_cast<int32_t>(shape)].fetch_add(blocked_count, std::memory_order_relaxed);
+        }
+
+        void on_pending_promote(int32_t type_idx) {
+            pending_promote_by_type[type_idx].fetch_add(1, std::memory_order_relaxed);
+            on_pending_hit(type_idx);
+        }
+
+        void on_idle_without_pending(int32_t type_idx) {
+            idle_without_pending_by_type[type_idx].fetch_add(1, std::memory_order_relaxed);
         }
 
         void on_pending_miss(int32_t type_idx, uint64_t ready_depth, int32_t visible_tasks) {
@@ -291,7 +319,7 @@ private:
 
     void dispatch_subtask_to_core(
         Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2SubtaskSlot subslot, bool to_pending
+        PTO2ResourceShape shape, PTO2SubtaskSlot subslot, bool to_pending
     );
 
     void dispatch_mix_block_to_cluster(
