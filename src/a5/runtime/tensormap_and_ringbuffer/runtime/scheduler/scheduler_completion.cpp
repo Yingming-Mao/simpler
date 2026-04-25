@@ -253,6 +253,10 @@ void SchedulerContext::check_running_cores_for_completion(
         // 2. Update slot data
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
+                // Pending slot promoted to running: treat as a local "pending hit".
+                int32_t type_idx =
+                    (bit_pos % 3 == 0) ? SchedulerContext::TWOSLOT_TYPE_AIC : SchedulerContext::TWOSLOT_TYPE_AIV;
+                twoslot_policy_.on_pending_hit(type_idx);
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
@@ -271,6 +275,22 @@ void SchedulerContext::check_running_cores_for_completion(
         if (is_idle) {
             tracker.change_core_state(bit_pos);       // Mark idle
             tracker.clear_pending_occupied(bit_pos);  // Idle safeguard: no payload to protect
+
+            // "Miss" accounting: core became idle without a pending promotion while
+            // the ready queues still have surplus work (steady fallback zone).
+            if (t.running_done) {
+                uint64_t q_aic = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size();
+                uint64_t q_aiv = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV)].size();
+                uint64_t q_mix = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size();
+                uint64_t ready_depth =
+                    (bit_pos % 3 == 0) ? (q_aic + q_mix) : (q_aiv + q_mix);
+                int32_t visible = (total_tasks_ > 0)
+                    ? (total_tasks_ - completed_tasks_.load(std::memory_order_relaxed))
+                    : 0;
+                int32_t type_idx =
+                    (bit_pos % 3 == 0) ? SchedulerContext::TWOSLOT_TYPE_AIC : SchedulerContext::TWOSLOT_TYPE_AIV;
+                twoslot_policy_.on_pending_miss(type_idx, ready_depth, visible);
+            }
         } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {
             // Case 4 (running ACK) or Case 2 (pending ACK): clear pending_occupied only
             // when no pending task is currently held. Otherwise pending slot is occupied

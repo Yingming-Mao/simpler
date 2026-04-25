@@ -111,6 +111,95 @@ private:
     // --- Scheduler binding & per-core runtime state ---
     alignas(64) PTO2SchedulerState *sched_{nullptr};
 
+    // =========================================================================
+    // Two-slot admission (pending-phase gating)
+    // =========================================================================
+    //
+    // The scheduler supports dual-issue by dispatching to IDLE cores first, then
+    // dispatching to RUNNING cores' pending slots (CoreTracker::DispatchPhase::PENDING).
+    //
+    // For some graphs, aggressive pending dispatch can be a net loss. This is an
+    // opt-in admission policy controlled via env vars read once at init() time.
+    enum : int32_t { TWOSLOT_TYPE_AIC = 0, TWOSLOT_TYPE_AIV = 1, TWOSLOT_TYPE_NUM = 2 };
+
+    struct TwoSlotAdmissionPolicy {
+        // Config (defaults match simpler-PTO knobs)
+        bool steady_gate_enabled{false};     // PTO2_TWOSLOT_ENABLE_STEADY_GATE
+        bool recent_negative_enabled{false}; // PTO2_TWOSLOT_ENABLE_RECENT_NEGATIVE
+        int32_t probe_ready_margin[TWOSLOT_TYPE_NUM]{2, 2};    // *_PROBE_READY_MARGIN
+        int32_t probe_min_visible[TWOSLOT_TYPE_NUM]{0, 8};     // *_PROBE_MIN_VISIBLE_TASKS
+        int32_t steady_ready_margin[TWOSLOT_TYPE_NUM]{3, 4};   // *_STEADY_READY_MARGIN
+        int32_t steady_min_visible[TWOSLOT_TYPE_NUM]{0, 8};    // *_STEADY_MIN_VISIBLE_TASKS
+        int32_t recent_miss_limit[TWOSLOT_TYPE_NUM]{3, 2};     // *_RECENT_MISS_LIMIT
+        int32_t recent_stolen_penalty[TWOSLOT_TYPE_NUM]{1, 2}; // *_RECENT_STOLEN_PENALTY (used as cooldown)
+
+        // State (shared across scheduler threads)
+        std::atomic<int32_t> cooldown[TWOSLOT_TYPE_NUM]{{0}, {0}};
+        std::atomic<int32_t> recent_miss_score[TWOSLOT_TYPE_NUM]{{0}, {0}};
+
+        void reset_runtime_state() {
+            for (int i = 0; i < TWOSLOT_TYPE_NUM; i++) {
+                cooldown[i].store(0, std::memory_order_relaxed);
+                recent_miss_score[i].store(0, std::memory_order_relaxed);
+            }
+        }
+
+        bool allow_pending_type(int32_t type_idx, uint64_t ready_depth, int32_t visible_tasks) const {
+            if (!steady_gate_enabled && !recent_negative_enabled) return true; // default behavior unchanged
+            if (recent_negative_enabled && cooldown[type_idx].load(std::memory_order_relaxed) > 0) return false;
+
+            if (visible_tasks < probe_min_visible[type_idx]) return false;
+            if (ready_depth < static_cast<uint64_t>(probe_ready_margin[type_idx])) return false;
+
+            if (steady_gate_enabled) {
+                if (visible_tasks < steady_min_visible[type_idx]) return false;
+                if (ready_depth < static_cast<uint64_t>(steady_ready_margin[type_idx])) return false;
+            }
+            return true;
+        }
+
+        bool allow_pending_shape(
+            PTO2ResourceShape shape, uint64_t ready_aic, uint64_t ready_aiv, int32_t visible_tasks
+        ) const {
+            if (shape == PTO2ResourceShape::AIC) return allow_pending_type(TWOSLOT_TYPE_AIC, ready_aic, visible_tasks);
+            if (shape == PTO2ResourceShape::AIV) return allow_pending_type(TWOSLOT_TYPE_AIV, ready_aiv, visible_tasks);
+            // MIX: conservative: only allow when both core types would allow.
+            return allow_pending_type(TWOSLOT_TYPE_AIC, ready_aic, visible_tasks) &&
+                   allow_pending_type(TWOSLOT_TYPE_AIV, ready_aiv, visible_tasks);
+        }
+
+        void tick() {
+            if (!recent_negative_enabled) return;
+            for (int i = 0; i < TWOSLOT_TYPE_NUM; i++) {
+                int32_t c = cooldown[i].load(std::memory_order_relaxed);
+                if (c > 0) cooldown[i].store(c - 1, std::memory_order_relaxed);
+            }
+        }
+
+        void on_pending_hit(int32_t type_idx) {
+            if (!recent_negative_enabled) return;
+            int32_t s = recent_miss_score[type_idx].load(std::memory_order_relaxed);
+            if (s > 0) recent_miss_score[type_idx].store(s - 1, std::memory_order_relaxed);
+        }
+
+        void on_pending_miss(int32_t type_idx, uint64_t ready_depth, int32_t visible_tasks) {
+            if (!recent_negative_enabled) return;
+            if (!steady_gate_enabled) return; // only count misses in "steady fallback" region
+            if (visible_tasks < steady_min_visible[type_idx]) return;
+            if (ready_depth < static_cast<uint64_t>(steady_ready_margin[type_idx])) return;
+
+            int32_t s = recent_miss_score[type_idx].fetch_add(1, std::memory_order_relaxed) + 1;
+            if (s >= recent_miss_limit[type_idx]) {
+                recent_miss_score[type_idx].store(0, std::memory_order_relaxed);
+                int32_t penalty = recent_stolen_penalty[type_idx];
+                if (penalty < 0) penalty = 0;
+                cooldown[type_idx].store(penalty, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    TwoSlotAdmissionPolicy twoslot_policy_;
+
     // Per-core execution state, indexed by core_id (= worker_id)
     CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
 

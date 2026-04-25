@@ -10,7 +10,10 @@
  */
 #include "scheduler_context.h"
 
+#include <cerrno>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
@@ -28,6 +31,19 @@
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
+
+static int32_t read_twoslot_int_env(const char *name, int32_t default_val) {
+    const char *env = std::getenv(name);
+    if (!env || env[0] == '\0') return default_val;
+    char *end = nullptr;
+    errno = 0;
+    long v = std::strtol(env, &end, 10);
+    if (errno == ERANGE || end == env || (end && *end != '\0')) {
+        DEV_INFO("twoslot env ignored: %s=%s", name, env);
+        return default_val;
+    }
+    return static_cast<int32_t>(v);
+}
 
 LoopAction SchedulerContext::handle_orchestrator_exit(
     int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
@@ -675,6 +691,35 @@ int32_t SchedulerContext::init(
 
     func_id_to_addr_ = runtime->func_id_to_addr_;
 
+    // Two-slot admission policy (opt-in via env).
+    twoslot_policy_.steady_gate_enabled = (read_twoslot_int_env("PTO2_TWOSLOT_ENABLE_STEADY_GATE", 0) != 0);
+    twoslot_policy_.recent_negative_enabled = (read_twoslot_int_env("PTO2_TWOSLOT_ENABLE_RECENT_NEGATIVE", 0) != 0);
+    twoslot_policy_.probe_ready_margin[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_PROBE_READY_MARGIN", 2);
+    twoslot_policy_.probe_ready_margin[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_PROBE_READY_MARGIN", 2);
+    twoslot_policy_.probe_min_visible[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_PROBE_MIN_VISIBLE_TASKS", 0);
+    twoslot_policy_.probe_min_visible[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_PROBE_MIN_VISIBLE_TASKS", 8);
+    twoslot_policy_.steady_ready_margin[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_STEADY_READY_MARGIN", 3);
+    twoslot_policy_.steady_ready_margin[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_STEADY_READY_MARGIN", 4);
+    twoslot_policy_.steady_min_visible[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_STEADY_MIN_VISIBLE_TASKS", 0);
+    twoslot_policy_.steady_min_visible[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_STEADY_MIN_VISIBLE_TASKS", 8);
+    twoslot_policy_.recent_miss_limit[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_RECENT_MISS_LIMIT", 3);
+    twoslot_policy_.recent_miss_limit[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_RECENT_MISS_LIMIT", 2);
+    twoslot_policy_.recent_stolen_penalty[TWOSLOT_TYPE_AIC] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIC_RECENT_STOLEN_PENALTY", 1);
+    twoslot_policy_.recent_stolen_penalty[TWOSLOT_TYPE_AIV] =
+        read_twoslot_int_env("PTO2_TWOSLOT_AIV_RECENT_STOLEN_PENALTY", 2);
+    twoslot_policy_.reset_runtime_state();
+
     return 0;
 }
 
@@ -702,6 +747,7 @@ void SchedulerContext::deinit() {
     orchestrator_done_ = false;
     pto2_init_done_.store(false, std::memory_order_release);
     pto2_init_complete_.store(false, std::memory_order_release);
+    twoslot_policy_.reset_runtime_state();
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);

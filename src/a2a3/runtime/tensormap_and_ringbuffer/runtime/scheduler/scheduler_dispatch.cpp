@@ -471,6 +471,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 4: Two-phase dispatch (idle then pending)
+        // Two-slot admission: optionally gate the PENDING phase by env-driven heuristics.
+        int32_t completed_now = completed_tasks_.load(std::memory_order_relaxed);
+        int32_t total_now = (task_count > 0) ? task_count : total_tasks_;
+        int32_t visible_tasks = (total_now > 0) ? (total_now - completed_now) : 0;
+        uint64_t q_aic = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size();
+        uint64_t q_aiv = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV)].size();
+        uint64_t q_mix = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size();
+        uint64_t ready_aic = q_aic + q_mix;
+        uint64_t ready_aiv = q_aiv + q_mix;
+        twoslot_policy_.tick();
+
         const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);
         bool entered_drain = false;
 
@@ -481,6 +492,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #else
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
 #endif
+                if (phase == CoreTracker::DispatchPhase::PENDING &&
+                    !twoslot_policy_.allow_pending_shape(shape, ready_aic, ready_aiv, visible_tasks)) {
+                    continue;
+                }
                 dispatch_shape(
                     runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
                     made_progress, try_pushed
