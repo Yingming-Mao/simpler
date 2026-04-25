@@ -228,7 +228,8 @@ void SchedulerContext::dispatch_block(
 
 void SchedulerContext::dispatch_shape(
     Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
-    PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed,
+    uint64_t ready_aic, uint64_t ready_aiv, int32_t visible_tasks
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
@@ -248,6 +249,12 @@ void SchedulerContext::dispatch_shape(
         bool dispatched_any = false;
         for (int bi = 0; bi < got; bi++) {
             PTO2TaskSlotState *slot_state = batch[bi];
+            if (is_pending &&
+                !twoslot_policy_.allow_pending_task(shape, *slot_state, ready_aic, ready_aiv, visible_tasks)) {
+                twoslot_policy_.on_pending_blocked(shape, 1);
+                sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                continue;
+            }
 
             if (pto2_requires_sync_start(slot_state->active_mask)) {
                 if (is_pending) {
@@ -518,7 +525,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
                 dispatch_shape(
                     runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
-                    made_progress, try_pushed
+                    made_progress, try_pushed, ready_aic, ready_aiv, visible_tasks
                 );
             }
         }

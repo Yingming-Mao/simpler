@@ -126,16 +126,24 @@ private:
         // Config (defaults match simpler-PTO knobs)
         bool steady_gate_enabled{false};     // PTO2_TWOSLOT_ENABLE_STEADY_GATE
         bool recent_negative_enabled{false}; // PTO2_TWOSLOT_ENABLE_RECENT_NEGATIVE
+        bool kernel_gate_enabled{false};     // PTO2_TWOSLOT_ENABLE_KERNEL_GATE
+        bool diagnostics_enabled{false};     // PTO2_TWOSLOT_ENABLE_DIAG
+        bool pending_enabled[TWOSLOT_TYPE_NUM]{true, true};
         int32_t probe_ready_margin[TWOSLOT_TYPE_NUM]{2, 2};    // *_PROBE_READY_MARGIN
         int32_t probe_min_visible[TWOSLOT_TYPE_NUM]{0, 8};     // *_PROBE_MIN_VISIBLE_TASKS
         int32_t steady_ready_margin[TWOSLOT_TYPE_NUM]{3, 4};   // *_STEADY_READY_MARGIN
         int32_t steady_min_visible[TWOSLOT_TYPE_NUM]{0, 8};    // *_STEADY_MIN_VISIBLE_TASKS
         int32_t recent_miss_limit[TWOSLOT_TYPE_NUM]{3, 2};     // *_RECENT_MISS_LIMIT
         int32_t recent_stolen_penalty[TWOSLOT_TYPE_NUM]{1, 2}; // *_RECENT_STOLEN_PENALTY (used as cooldown)
+        int32_t kernel_probe_interval[TWOSLOT_TYPE_NUM]{8, 16};
+        int32_t kernel_admit_score[TWOSLOT_TYPE_NUM]{3, 3};
+        int32_t kernel_admit_stride[TWOSLOT_TYPE_NUM]{2, 4};
 
         // State (shared across scheduler threads)
         std::atomic<int32_t> cooldown[TWOSLOT_TYPE_NUM]{{0}, {0}};
         std::atomic<int32_t> recent_miss_score[TWOSLOT_TYPE_NUM]{{0}, {0}};
+        std::atomic<int32_t> kernel_score[TWOSLOT_TYPE_NUM][RUNTIME_MAX_FUNC_ID]{};
+        std::atomic<uint32_t> kernel_attempt[TWOSLOT_TYPE_NUM][RUNTIME_MAX_FUNC_ID]{};
         std::atomic<uint64_t> pending_dispatch_by_shape[PTO2_NUM_RESOURCE_SHAPES]{{0}, {0}, {0}};
         std::atomic<uint64_t> pending_blocked_by_shape[PTO2_NUM_RESOURCE_SHAPES]{{0}, {0}, {0}};
         std::atomic<uint64_t> pending_promote_by_type[TWOSLOT_TYPE_NUM]{{0}, {0}};
@@ -147,6 +155,10 @@ private:
                 recent_miss_score[i].store(0, std::memory_order_relaxed);
                 pending_promote_by_type[i].store(0, std::memory_order_relaxed);
                 idle_without_pending_by_type[i].store(0, std::memory_order_relaxed);
+                for (int k = 0; k < RUNTIME_MAX_FUNC_ID; k++) {
+                    kernel_score[i][k].store(0, std::memory_order_relaxed);
+                    kernel_attempt[i][k].store(0, std::memory_order_relaxed);
+                }
             }
             for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
                 pending_dispatch_by_shape[i].store(0, std::memory_order_relaxed);
@@ -155,6 +167,7 @@ private:
         }
 
         bool allow_pending_type(int32_t type_idx, uint64_t ready_depth, int32_t visible_tasks) const {
+            if (!pending_enabled[type_idx]) return false;
             if (!steady_gate_enabled && !recent_negative_enabled) return true; // default behavior unchanged
             if (recent_negative_enabled && cooldown[type_idx].load(std::memory_order_relaxed) > 0) return false;
 
@@ -178,6 +191,37 @@ private:
                    allow_pending_type(TWOSLOT_TYPE_AIV, ready_aiv, visible_tasks);
         }
 
+        static int32_t shape_type_idx(PTO2ResourceShape shape) {
+            return (shape == PTO2ResourceShape::AIC) ? TWOSLOT_TYPE_AIC : TWOSLOT_TYPE_AIV;
+        }
+
+        static int32_t shape_kernel_id(PTO2ResourceShape shape, PTO2TaskSlotState &slot_state) {
+            if (shape == PTO2ResourceShape::AIC) return slot_state.task->kernel_id[static_cast<int32_t>(PTO2SubtaskSlot::AIC)];
+            if (shape == PTO2ResourceShape::AIV) return slot_state.task->kernel_id[static_cast<int32_t>(PTO2SubtaskSlot::AIV0)];
+            return slot_state.task->kernel_id[static_cast<int32_t>(PTO2SubtaskSlot::AIC)];
+        }
+
+        bool allow_pending_kernel(int32_t type_idx, int32_t kernel_id) {
+            if (!kernel_gate_enabled) return true;
+            if (kernel_id < 0 || kernel_id >= RUNTIME_MAX_FUNC_ID) return false;
+
+            int32_t score = kernel_score[type_idx][kernel_id].load(std::memory_order_relaxed);
+            int32_t stride = (score >= kernel_admit_score[type_idx]) ? kernel_admit_stride[type_idx] :
+                                                                       kernel_probe_interval[type_idx];
+            if (stride <= 1) return true;
+            uint32_t attempt = kernel_attempt[type_idx][kernel_id].fetch_add(1, std::memory_order_relaxed) + 1;
+            return (attempt % static_cast<uint32_t>(stride)) == 0;
+        }
+
+        bool allow_pending_task(
+            PTO2ResourceShape shape, PTO2TaskSlotState &slot_state, uint64_t ready_aic, uint64_t ready_aiv,
+            int32_t visible_tasks
+        ) {
+            if (!allow_pending_shape(shape, ready_aic, ready_aiv, visible_tasks)) return false;
+            if (shape == PTO2ResourceShape::MIX) return !kernel_gate_enabled;
+            return allow_pending_kernel(shape_type_idx(shape), shape_kernel_id(shape, slot_state));
+        }
+
         void tick() {
             if (!recent_negative_enabled) return;
             for (int i = 0; i < TWOSLOT_TYPE_NUM; i++) {
@@ -193,20 +237,33 @@ private:
         }
 
         void on_pending_dispatch(PTO2ResourceShape shape) {
+            if (!diagnostics_enabled) return;
             pending_dispatch_by_shape[static_cast<int32_t>(shape)].fetch_add(1, std::memory_order_relaxed);
         }
 
         void on_pending_blocked(PTO2ResourceShape shape, int32_t blocked_count) {
+            if (!diagnostics_enabled) return;
             if (blocked_count <= 0) return;
             pending_blocked_by_shape[static_cast<int32_t>(shape)].fetch_add(blocked_count, std::memory_order_relaxed);
         }
 
-        void on_pending_promote(int32_t type_idx) {
-            pending_promote_by_type[type_idx].fetch_add(1, std::memory_order_relaxed);
+        void on_pending_success(int32_t type_idx, int32_t kernel_id) {
+            if (!kernel_gate_enabled) return;
+            if (kernel_id < 0 || kernel_id >= RUNTIME_MAX_FUNC_ID) return;
+            int32_t score = kernel_score[type_idx][kernel_id].load(std::memory_order_relaxed);
+            if (score < 8) kernel_score[type_idx][kernel_id].store(score + 1, std::memory_order_relaxed);
+        }
+
+        void on_pending_promote(int32_t type_idx, int32_t kernel_id) {
+            if (diagnostics_enabled) {
+                pending_promote_by_type[type_idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            on_pending_success(type_idx, kernel_id);
             on_pending_hit(type_idx);
         }
 
         void on_idle_without_pending(int32_t type_idx) {
+            if (!diagnostics_enabled) return;
             idle_without_pending_by_type[type_idx].fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -334,7 +391,7 @@ private:
     void dispatch_shape(
         Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
         PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
-        bool &try_pushed
+        bool &try_pushed, uint64_t ready_aic, uint64_t ready_aiv, int32_t visible_tasks
     );
 
     // =========================================================================

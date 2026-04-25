@@ -70,6 +70,54 @@ static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool requir
     return static_cast<uint64_t>(val);
 }
 
+static int32_t parse_env_int32(const char *name, int32_t default_val) {
+    const char *env = std::getenv(name);
+    if (!env || env[0] == '\0') return default_val;
+    char *endptr;
+    errno = 0;
+    long val = strtol(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0') {
+        LOG_WARN("%s=%s invalid, using default %d", name, env, default_val);
+        return default_val;
+    }
+    return static_cast<int32_t>(val);
+}
+
+static void configure_twoslot(Runtime *runtime) {
+    auto &cfg = runtime->twoslot_config;
+    cfg.steady_gate_enabled = parse_env_int32("PTO2_TWOSLOT_ENABLE_STEADY_GATE", 0);
+    cfg.recent_negative_enabled = parse_env_int32("PTO2_TWOSLOT_ENABLE_RECENT_NEGATIVE", 0);
+    cfg.kernel_gate_enabled = parse_env_int32("PTO2_TWOSLOT_ENABLE_KERNEL_GATE", 0);
+    cfg.diagnostics_enabled = parse_env_int32("PTO2_TWOSLOT_ENABLE_DIAG", 0);
+    cfg.pending_enabled[0] = parse_env_int32("PTO2_TWOSLOT_AIC_PENDING_ENABLE", 1);
+    cfg.pending_enabled[1] = parse_env_int32("PTO2_TWOSLOT_AIV_PENDING_ENABLE", 1);
+    cfg.probe_ready_margin[0] = parse_env_int32("PTO2_TWOSLOT_AIC_PROBE_READY_MARGIN", 2);
+    cfg.probe_ready_margin[1] = parse_env_int32("PTO2_TWOSLOT_AIV_PROBE_READY_MARGIN", 2);
+    cfg.probe_min_visible[0] = parse_env_int32("PTO2_TWOSLOT_AIC_PROBE_MIN_VISIBLE_TASKS", 0);
+    cfg.probe_min_visible[1] = parse_env_int32("PTO2_TWOSLOT_AIV_PROBE_MIN_VISIBLE_TASKS", 8);
+    cfg.steady_ready_margin[0] = parse_env_int32("PTO2_TWOSLOT_AIC_STEADY_READY_MARGIN", 3);
+    cfg.steady_ready_margin[1] = parse_env_int32("PTO2_TWOSLOT_AIV_STEADY_READY_MARGIN", 4);
+    cfg.steady_min_visible[0] = parse_env_int32("PTO2_TWOSLOT_AIC_STEADY_MIN_VISIBLE_TASKS", 0);
+    cfg.steady_min_visible[1] = parse_env_int32("PTO2_TWOSLOT_AIV_STEADY_MIN_VISIBLE_TASKS", 8);
+    cfg.recent_miss_limit[0] = parse_env_int32("PTO2_TWOSLOT_AIC_RECENT_MISS_LIMIT", 3);
+    cfg.recent_miss_limit[1] = parse_env_int32("PTO2_TWOSLOT_AIV_RECENT_MISS_LIMIT", 2);
+    cfg.recent_stolen_penalty[0] = parse_env_int32("PTO2_TWOSLOT_AIC_RECENT_STOLEN_PENALTY", 1);
+    cfg.recent_stolen_penalty[1] = parse_env_int32("PTO2_TWOSLOT_AIV_RECENT_STOLEN_PENALTY", 2);
+    cfg.kernel_probe_interval[0] = parse_env_int32("PTO2_TWOSLOT_AIC_KERNEL_PROBE_INTERVAL", 8);
+    cfg.kernel_probe_interval[1] = parse_env_int32("PTO2_TWOSLOT_AIV_KERNEL_PROBE_INTERVAL", 16);
+    cfg.kernel_admit_score[0] = parse_env_int32("PTO2_TWOSLOT_AIC_KERNEL_ADMIT_SCORE", 3);
+    cfg.kernel_admit_score[1] = parse_env_int32("PTO2_TWOSLOT_AIV_KERNEL_ADMIT_SCORE", 3);
+    cfg.kernel_admit_stride[0] = parse_env_int32("PTO2_TWOSLOT_AIC_KERNEL_ADMIT_STRIDE", 2);
+    cfg.kernel_admit_stride[1] = parse_env_int32("PTO2_TWOSLOT_AIV_KERNEL_ADMIT_STRIDE", 4);
+    LOG_INFO(
+        "Two-slot config: steady=%d recent=%d kernel=%d diag=%d pending[AIC=%d,AIV=%d] aic_probe=%d "
+        "aic_stride=%d aiv_probe=%d aiv_stride=%d",
+        cfg.steady_gate_enabled, cfg.recent_negative_enabled, cfg.kernel_gate_enabled, cfg.diagnostics_enabled,
+        cfg.pending_enabled[0], cfg.pending_enabled[1], cfg.kernel_probe_interval[0], cfg.kernel_admit_stride[0],
+        cfg.kernel_probe_interval[1], cfg.kernel_admit_stride[1]
+    );
+}
+
 static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
@@ -152,6 +200,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     LOG_INFO("RT2 init: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
 
     int64_t t_total_start = _now_ms();
+    configure_twoslot(runtime);
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;

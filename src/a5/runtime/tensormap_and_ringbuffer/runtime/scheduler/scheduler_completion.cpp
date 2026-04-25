@@ -228,6 +228,13 @@ void SchedulerContext::check_running_cores_for_completion(
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
         if (t.pending_done) {
+            int32_t pending_type_idx = (core.pending_subslot == PTO2SubtaskSlot::AIC) ?
+                                           SchedulerContext::TWOSLOT_TYPE_AIC :
+                                           SchedulerContext::TWOSLOT_TYPE_AIV;
+            int32_t pending_kernel_id = core.pending_slot_state->task->kernel_id[static_cast<int32_t>(
+                core.pending_subslot
+            )];
+            twoslot_policy_.on_pending_success(pending_type_idx, pending_kernel_id);
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
@@ -256,7 +263,10 @@ void SchedulerContext::check_running_cores_for_completion(
                 // Pending slot promoted to running: treat as a local "pending hit".
                 int32_t type_idx =
                     (bit_pos % 3 == 0) ? SchedulerContext::TWOSLOT_TYPE_AIC : SchedulerContext::TWOSLOT_TYPE_AIV;
-                twoslot_policy_.on_pending_promote(type_idx);
+                int32_t kernel_id = core.pending_slot_state->task->kernel_id[static_cast<int32_t>(
+                    core.pending_subslot
+                )];
+                twoslot_policy_.on_pending_promote(type_idx, kernel_id);
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)

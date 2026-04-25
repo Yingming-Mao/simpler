@@ -28,23 +28,6 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
-// =============================================================================
-// Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
-// =============================================================================
-
-static int32_t read_twoslot_int_env(const char *name, int32_t default_val) {
-    const char *env = std::getenv(name);
-    if (!env || env[0] == '\0') return default_val;
-    char *end = nullptr;
-    errno = 0;
-    long v = std::strtol(env, &end, 10);
-    if (errno == ERANGE || end == env || (end && *end != '\0')) {
-        DEV_INFO("twoslot env ignored: %s=%s", name, env);
-        return default_val;
-    }
-    return static_cast<int32_t>(v);
-}
-
 LoopAction SchedulerContext::handle_orchestrator_exit(
     int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
 ) {
@@ -349,7 +332,7 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         }
     }
 #endif
-    if (thread_idx == 0) {
+    if (thread_idx == 0 && twoslot_policy_.diagnostics_enabled) {
         auto load_shape = [this](PTO2ResourceShape shape, auto &counters) {
             return static_cast<uint64_t>(counters[static_cast<int32_t>(shape)].load(std::memory_order_relaxed));
         };
@@ -714,33 +697,25 @@ int32_t SchedulerContext::init(
 
     func_id_to_addr_ = runtime->func_id_to_addr_;
 
-    // Two-slot admission policy (opt-in via env).
-    twoslot_policy_.steady_gate_enabled = (read_twoslot_int_env("PTO2_TWOSLOT_ENABLE_STEADY_GATE", 0) != 0);
-    twoslot_policy_.recent_negative_enabled = (read_twoslot_int_env("PTO2_TWOSLOT_ENABLE_RECENT_NEGATIVE", 0) != 0);
-    twoslot_policy_.probe_ready_margin[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_PROBE_READY_MARGIN", 2);
-    twoslot_policy_.probe_ready_margin[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_PROBE_READY_MARGIN", 2);
-    twoslot_policy_.probe_min_visible[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_PROBE_MIN_VISIBLE_TASKS", 0);
-    twoslot_policy_.probe_min_visible[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_PROBE_MIN_VISIBLE_TASKS", 8);
-    twoslot_policy_.steady_ready_margin[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_STEADY_READY_MARGIN", 3);
-    twoslot_policy_.steady_ready_margin[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_STEADY_READY_MARGIN", 4);
-    twoslot_policy_.steady_min_visible[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_STEADY_MIN_VISIBLE_TASKS", 0);
-    twoslot_policy_.steady_min_visible[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_STEADY_MIN_VISIBLE_TASKS", 8);
-    twoslot_policy_.recent_miss_limit[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_RECENT_MISS_LIMIT", 3);
-    twoslot_policy_.recent_miss_limit[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_RECENT_MISS_LIMIT", 2);
-    twoslot_policy_.recent_stolen_penalty[TWOSLOT_TYPE_AIC] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIC_RECENT_STOLEN_PENALTY", 1);
-    twoslot_policy_.recent_stolen_penalty[TWOSLOT_TYPE_AIV] =
-        read_twoslot_int_env("PTO2_TWOSLOT_AIV_RECENT_STOLEN_PENALTY", 2);
+    // Two-slot admission policy. Host reads env and copies config into Runtime
+    // because AICPU getenv does not reliably observe the launcher environment.
+    const auto &cfg = runtime->twoslot_config;
+    twoslot_policy_.steady_gate_enabled = (cfg.steady_gate_enabled != 0);
+    twoslot_policy_.recent_negative_enabled = (cfg.recent_negative_enabled != 0);
+    twoslot_policy_.kernel_gate_enabled = (cfg.kernel_gate_enabled != 0);
+    twoslot_policy_.diagnostics_enabled = (cfg.diagnostics_enabled != 0);
+    for (int32_t i = 0; i < TWOSLOT_TYPE_NUM; i++) {
+        twoslot_policy_.pending_enabled[i] = (cfg.pending_enabled[i] != 0);
+        twoslot_policy_.probe_ready_margin[i] = cfg.probe_ready_margin[i];
+        twoslot_policy_.probe_min_visible[i] = cfg.probe_min_visible[i];
+        twoslot_policy_.steady_ready_margin[i] = cfg.steady_ready_margin[i];
+        twoslot_policy_.steady_min_visible[i] = cfg.steady_min_visible[i];
+        twoslot_policy_.recent_miss_limit[i] = cfg.recent_miss_limit[i];
+        twoslot_policy_.recent_stolen_penalty[i] = cfg.recent_stolen_penalty[i];
+        twoslot_policy_.kernel_probe_interval[i] = cfg.kernel_probe_interval[i];
+        twoslot_policy_.kernel_admit_score[i] = cfg.kernel_admit_score[i];
+        twoslot_policy_.kernel_admit_stride[i] = cfg.kernel_admit_stride[i];
+    }
     twoslot_policy_.reset_runtime_state();
 
     return 0;

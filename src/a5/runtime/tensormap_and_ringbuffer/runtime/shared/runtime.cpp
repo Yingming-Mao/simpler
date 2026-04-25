@@ -38,6 +38,7 @@ Runtime::Runtime() {
     pto2_heap_size = 0;
     pto2_dep_pool_size = 0;
     orch_to_sched = false;
+    memset(&twoslot_config, 0, sizeof(twoslot_config));
 
     // Initialize profiling state
     enable_l2_swimlane = false;

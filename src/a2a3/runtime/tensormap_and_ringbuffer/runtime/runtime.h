@@ -149,6 +149,23 @@ struct Task {
     uint64_t function_bin_addr;
 };
 
+struct PTO2TwoSlotConfig {
+    int32_t steady_gate_enabled;
+    int32_t recent_negative_enabled;
+    int32_t kernel_gate_enabled;
+    int32_t diagnostics_enabled;
+    int32_t pending_enabled[2];
+    int32_t probe_ready_margin[2];
+    int32_t probe_min_visible[2];
+    int32_t steady_ready_margin[2];
+    int32_t steady_min_visible[2];
+    int32_t recent_miss_limit[2];
+    int32_t recent_stolen_penalty[2];
+    int32_t kernel_probe_interval[2];
+    int32_t kernel_admit_score[2];
+    int32_t kernel_admit_stride[2];
+};
+
 // =============================================================================
 // Runtime Class
 // =============================================================================
@@ -188,6 +205,9 @@ public:
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
     uint64_t l2_perf_data_base;  // Performance data shared memory base address (device-side)
+
+    // Host-read two-slot admission config copied into the device Runtime.
+    PTO2TwoSlotConfig twoslot_config;
 
 private:
     // Tensor pairs for host-device memory tracking
