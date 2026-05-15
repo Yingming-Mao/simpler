@@ -176,14 +176,14 @@ static uint32_t parse_prefetch_suppress_window() {
 static uint32_t parse_prefetch_subview_ranges() {
     const char *env = std::getenv("PTO_SDMA_PREFETCH_SUBVIEW_RANGES");
     if (env == nullptr || *env == '\0') {
-        return 2;
+        return 1;
     }
     char *endptr = nullptr;
     errno = 0;
     unsigned long value = strtoul(env, &endptr, 10);
     if (errno == ERANGE || endptr == env || *endptr != '\0' || value == 0 || value > 6) {
-        LOG_WARN("PTO_SDMA_PREFETCH_SUBVIEW_RANGES=%s invalid, using default %u", env, 2u);
-        return 2;
+        LOG_WARN("PTO_SDMA_PREFETCH_SUBVIEW_RANGES=%s invalid, using default %u", env, 1u);
+        return 1;
     }
     return static_cast<uint32_t>(value);
 }
@@ -380,7 +380,7 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
     runtime->sdma_prefetch_suppress_window = parse_prefetch_suppress_window();
     runtime->sdma_prefetch_tensor = parse_prefetch_bool("PTO_SDMA_PREFETCH_TENSOR", true);
     runtime->sdma_prefetch_instr = parse_prefetch_bool("PTO_SDMA_PREFETCH_INSTR", false);
-    runtime->sdma_prefetch_ready = parse_prefetch_bool("PTO_SDMA_PREFETCH_READY", false);
+    runtime->sdma_prefetch_ready = parse_prefetch_bool("PTO_SDMA_PREFETCH_READY", true);
     runtime->sdma_prefetch_pending_only = parse_prefetch_bool("PTO_SDMA_PREFETCH_PENDING_ONLY", false);
     runtime->sdma_prefetch_whole_kv = parse_prefetch_bool("PTO_SDMA_PREFETCH_WHOLE_KV", false);
     runtime->sdma_prefetch_whole_kv_max_bytes = parse_prefetch_whole_kv_max_bytes();

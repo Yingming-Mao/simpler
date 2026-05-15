@@ -37,11 +37,11 @@ Runtime::Runtime() {
     prefetch_mode = Runtime::PREFETCH_MODE_OFF;
     sdma_prefetch_min_bytes = 256 * 1024;
     sdma_prefetch_max_bytes = 1024 * 1024;
-    sdma_prefetch_subview_ranges = 2;
+    sdma_prefetch_subview_ranges = 1;
     sdma_prefetch_suppress_window = 2;
     sdma_prefetch_tensor = true;
     sdma_prefetch_instr = false;
-    sdma_prefetch_ready = false;
+    sdma_prefetch_ready = true;
     sdma_prefetch_pending_only = false;
     sdma_prefetch_whole_kv = false;
     sdma_prefetch_whole_kv_max_bytes = 128 * 1024 * 1024;

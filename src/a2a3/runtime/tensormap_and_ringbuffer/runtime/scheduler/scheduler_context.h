@@ -169,10 +169,10 @@ private:
     uint32_t prefetch_mode_{0};
     uint64_t sdma_prefetch_min_bytes_{256 * 1024};
     uint64_t sdma_prefetch_max_bytes_{1024 * 1024};
-    uint32_t sdma_prefetch_subview_ranges_{2};
+    uint32_t sdma_prefetch_subview_ranges_{1};
     bool sdma_prefetch_tensor_{true};
     bool sdma_prefetch_instr_{false};
-    bool sdma_prefetch_ready_{false};
+    bool sdma_prefetch_ready_{true};
     bool sdma_prefetch_pending_only_{false};
     bool sdma_prefetch_whole_kv_{false};
     uint64_t sdma_prefetch_whole_kv_max_bytes_{128 * 1024 * 1024};

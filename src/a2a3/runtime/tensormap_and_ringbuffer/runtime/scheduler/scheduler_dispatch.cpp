@@ -52,6 +52,17 @@ bool is_prefetch_read_arg(uint8_t raw_type) {
     return type == TensorArgType::INPUT || type == TensorArgType::INOUT || type == TensorArgType::NO_DEP;
 }
 
+bool is_simple_two_input_aic_task(const PTO2TaskPayload &task_payload) {
+    if (task_payload.tensor_count != 3) {
+        return false;
+    }
+    TensorArgType arg0 = static_cast<TensorArgType>(task_payload.tensor_arg_types[0]);
+    TensorArgType arg1 = static_cast<TensorArgType>(task_payload.tensor_arg_types[1]);
+    TensorArgType arg2 = static_cast<TensorArgType>(task_payload.tensor_arg_types[2]);
+    return arg0 == TensorArgType::INPUT && arg1 == TensorArgType::INPUT &&
+           (arg2 == TensorArgType::OUTPUT || arg2 == TensorArgType::OUTPUT_EXISTING);
+}
+
 bool get_contiguous_tensor_range(const Tensor &tensor, uint64_t &addr, uint64_t &size) {
     if (tensor.buffer.addr == 0 || !tensor.is_contiguous()) {
         return false;
@@ -121,6 +132,9 @@ int32_t collect_tensor_prefetch_ranges(
         return 0;
     }
     PTO2TaskPayload &task_payload = *slot_state.payload;
+    if (!is_simple_two_input_aic_task(task_payload)) {
+        return 0;
+    }
     int32_t range_count = 0;
     uint32_t subview_range_count = 0;
     if (subview_range_cap == 0 || subview_range_cap > PTO2_PREFETCH_TENSOR_RANGE_CAP) {

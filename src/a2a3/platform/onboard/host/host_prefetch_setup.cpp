@@ -57,6 +57,7 @@ using RtStreamGetSqidFn = int (*)(const void* stream, uint32_t* sqId);
 using RtStreamGetCqidFn = int (*)(const void* stream, uint32_t* cqId, uint32_t* logicCqId);
 
 static constexpr size_t SDMA_WORKSPACE_SIZE = 16 * 1024;
+static constexpr int DEFAULT_SDMA_CHANNEL_COUNT = 8;
 
 // State for cleanup
 static std::vector<void*> g_prefetch_streams;
@@ -88,7 +89,7 @@ static int resolve_channel_count(int requested_count)
 
     const char* env = std::getenv("PTO_SDMA_PREFETCH_CHANNELS");
     if (env == nullptr || *env == '\0') {
-        return requested_count;
+        return requested_count < DEFAULT_SDMA_CHANNEL_COUNT ? requested_count : DEFAULT_SDMA_CHANNEL_COUNT;
     }
 
     char* end = nullptr;
