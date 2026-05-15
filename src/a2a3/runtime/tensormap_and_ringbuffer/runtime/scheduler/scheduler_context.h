@@ -166,6 +166,18 @@ private:
 
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
+    uint32_t prefetch_mode_{0};
+    uint64_t sdma_prefetch_min_bytes_{256 * 1024};
+    uint64_t sdma_prefetch_max_bytes_{1024 * 1024};
+    uint32_t sdma_prefetch_subview_ranges_{2};
+    bool sdma_prefetch_tensor_{true};
+    bool sdma_prefetch_instr_{false};
+    bool sdma_prefetch_ready_{false};
+    bool sdma_prefetch_pending_only_{false};
+    bool sdma_prefetch_whole_kv_{false};
+    uint64_t sdma_prefetch_whole_kv_max_bytes_{128 * 1024 * 1024};
+    bool sdma_prefetch_debug_{false};
+    std::atomic<uint64_t> sdma_prefetch_tensor_seq_{0};
 
 #if PTO2_PROFILING
     // PMU profiling: physical core IDs for PMU MMIO base resolution.

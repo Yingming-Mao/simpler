@@ -238,6 +238,8 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    uint8_t tensor_arg_types[MAX_TENSOR_ARGS]{};
+    std::atomic<uint8_t> sdma_tensor_prefetched{0};
     // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 41-44 (256B) — scalars ===
@@ -260,9 +262,11 @@ struct PTO2TaskPayload {
     void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
+        sdma_tensor_prefetched.store(0, std::memory_order_relaxed);
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
+            tensor_arg_types[i] = static_cast<uint8_t>(args.tag(i));
             if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(*args.tensor(i).ptr);
             } else {

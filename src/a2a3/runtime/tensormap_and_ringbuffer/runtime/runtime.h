@@ -158,6 +158,11 @@ struct Task {
  */
 class Runtime {
 public:
+    enum PrefetchMode : uint32_t {
+        PREFETCH_MODE_OFF = 0,
+        PREFETCH_MODE_SDMA = 1,
+    };
+
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -165,6 +170,18 @@ public:
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;        // Number of AICPU threads for scheduling
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
+    uint32_t prefetch_mode;  // off / sdma
+    uint64_t sdma_prefetch_min_bytes;  // Minimum task payload bytes to enable SDMA prefetch
+    uint64_t sdma_prefetch_max_bytes;  // Maximum bytes per tensor prefetch window (0 = full tensor)
+    uint32_t sdma_prefetch_subview_ranges;  // Maximum read-side subview tensor ranges prefetched per task
+    uint32_t sdma_prefetch_suppress_window;  // Per-channel suppression window after a successful issue
+    bool sdma_prefetch_tensor;  // Enable tensor-data SDMA prefetch
+    bool sdma_prefetch_instr;  // Enable AIC kernel instruction SDMA prefetch
+    bool sdma_prefetch_ready;  // Enable ready-queue tensor SDMA prefetch before core dispatch
+    bool sdma_prefetch_pending_only;  // Only prefetch tasks staged into a pending AICore slot
+    bool sdma_prefetch_whole_kv;  // Enable one-shot whole-KV-cache SDMA prefetch experiment
+    uint64_t sdma_prefetch_whole_kv_max_bytes;  // Maximum bytes for whole-KV prefetch (0 = full tensor)
+    bool sdma_prefetch_debug;  // Enable extra SDMA debug counters/logging
 
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t task_window_size;
@@ -180,6 +197,7 @@ public:
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
+    void *sdma_prefetch_workspace;  // Host-created STARS channel workspace
 
 private:
     // Tensor pairs for host-device memory tracking

@@ -13,6 +13,7 @@
 #include <cinttypes>
 
 #include "common/unified_log.h"
+#include "aicpu/device_prefetch.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -38,6 +39,148 @@
 
 namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+inline constexpr int32_t PTO2_PREFETCH_TENSOR_RANGE_CAP = 6;
+inline constexpr uint32_t PTO2_DEFAULT_PREFETCH_SUBVIEW_RANGE_CAP = 2;
+
+struct TensorPrefetchRange {
+    uint64_t addr{0};
+    uint64_t size{0};
+};
+
+bool is_prefetch_read_arg(uint8_t raw_type) {
+    TensorArgType type = static_cast<TensorArgType>(raw_type);
+    return type == TensorArgType::INPUT || type == TensorArgType::INOUT || type == TensorArgType::NO_DEP;
+}
+
+bool get_contiguous_tensor_range(const Tensor &tensor, uint64_t &addr, uint64_t &size) {
+    if (tensor.buffer.addr == 0 || !tensor.is_contiguous()) {
+        return false;
+    }
+    uint64_t elem_size = get_element_size(tensor.dtype);
+    uint64_t byte_offset = tensor.start_offset * elem_size;
+    uint64_t byte_size = tensor.numel() * elem_size;
+    if (byte_size == 0 || byte_offset >= tensor.buffer.size) {
+        return false;
+    }
+    if (byte_offset == 0 && byte_size >= tensor.buffer.size) {
+        return false;
+    }
+    uint64_t remaining = tensor.buffer.size - byte_offset;
+    addr = tensor.buffer.addr + byte_offset;
+    size = byte_size < remaining ? byte_size : remaining;
+    return size != 0;
+}
+
+bool is_whole_kv_cache_candidate(const PTO2TaskPayload &task_payload) {
+    if (task_payload.tensor_count < 3 || !is_prefetch_read_arg(task_payload.tensor_arg_types[1]) ||
+        !is_prefetch_read_arg(task_payload.tensor_arg_types[2])) {
+        return false;
+    }
+    const Tensor &kv_cache = task_payload.tensors[1];
+    const Tensor &block_table = task_payload.tensors[2];
+    if (kv_cache.buffer.addr == 0 || block_table.buffer.addr == 0 || block_table.dtype != DataType::INT32) {
+        return false;
+    }
+    if (kv_cache.start_offset != 0 || kv_cache.numel() * get_element_size(kv_cache.dtype) < kv_cache.buffer.size) {
+        return false;
+    }
+    return kv_cache.ndims >= 2 && block_table.ndims >= 2;
+}
+
+bool add_prefetch_range(
+    TensorPrefetchRange ranges[], int32_t &range_count, uint64_t addr, uint64_t size, uint64_t min_bytes,
+    uint64_t max_bytes
+) {
+    if (addr == 0 || size < min_bytes) {
+        return false;
+    }
+    if (max_bytes != 0 && size > max_bytes) {
+        size = max_bytes;
+    }
+    int32_t insert_idx = range_count;
+    if (insert_idx < PTO2_PREFETCH_TENSOR_RANGE_CAP) {
+        range_count++;
+    } else if (size > ranges[PTO2_PREFETCH_TENSOR_RANGE_CAP - 1].size) {
+        insert_idx = PTO2_PREFETCH_TENSOR_RANGE_CAP - 1;
+    } else {
+        return false;
+    }
+    while (insert_idx > 0 && size > ranges[insert_idx - 1].size) {
+        ranges[insert_idx] = ranges[insert_idx - 1];
+        insert_idx--;
+    }
+    ranges[insert_idx] = TensorPrefetchRange{addr, size};
+    return true;
+}
+
+int32_t collect_tensor_prefetch_ranges(
+    PTO2TaskSlotState &slot_state, uint64_t min_bytes, uint64_t max_bytes, uint32_t subview_range_cap, bool whole_kv,
+    uint64_t whole_kv_max_bytes, std::atomic<uint64_t> &tensor_seq, TensorPrefetchRange ranges[]
+) {
+    if (slot_state.payload == nullptr) {
+        return 0;
+    }
+    PTO2TaskPayload &task_payload = *slot_state.payload;
+    int32_t range_count = 0;
+    uint32_t subview_range_count = 0;
+    if (subview_range_cap == 0 || subview_range_cap > PTO2_PREFETCH_TENSOR_RANGE_CAP) {
+        subview_range_cap = PTO2_DEFAULT_PREFETCH_SUBVIEW_RANGE_CAP;
+    }
+    for (int32_t i = 0; i < task_payload.tensor_count; ++i) {
+        if (!is_prefetch_read_arg(task_payload.tensor_arg_types[i])) {
+            continue;
+        }
+        const Tensor &tensor = task_payload.tensors[i];
+        uint64_t tensor_addr = 0;
+        uint64_t tensor_size = 0;
+        if (!get_contiguous_tensor_range(tensor, tensor_addr, tensor_size)) {
+            continue;
+        }
+        if (tensor_size < min_bytes) {
+            continue;
+        }
+        if (max_bytes != 0 && tensor_size > max_bytes) {
+            uint64_t window_count = (tensor_size + max_bytes - 1) / max_bytes;
+            uint64_t window_idx = 0;
+            if (slot_state.logical_block_num > 1) {
+                uint64_t block_num = static_cast<uint64_t>(slot_state.logical_block_num);
+                uint64_t block_idx = slot_state.next_block_idx >= 0 ? static_cast<uint64_t>(slot_state.next_block_idx) : 0;
+                window_idx = (block_idx * window_count) / block_num;
+            } else {
+                window_idx = tensor_seq.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (window_idx >= window_count) {
+                window_idx %= window_count;
+            }
+            uint64_t offset = max_bytes * window_idx;
+            uint64_t remaining = tensor_size - offset;
+            tensor_addr += offset;
+            tensor_size = remaining < max_bytes ? remaining : max_bytes;
+        }
+        if (add_prefetch_range(ranges, range_count, tensor_addr, tensor_size, min_bytes, max_bytes)) {
+            subview_range_count++;
+            if (subview_range_count >= subview_range_cap) {
+                break;
+            }
+        }
+    }
+    if (whole_kv && is_whole_kv_cache_candidate(task_payload)) {
+        const Tensor &kv_cache = task_payload.tensors[1];
+        add_prefetch_range(ranges, range_count, kv_cache.buffer.addr, kv_cache.buffer.size, min_bytes, whole_kv_max_bytes);
+    }
+    return range_count;
+}
+
+void issue_tensor_prefetch_ranges(const TensorPrefetchRange ranges[], int32_t range_count, int32_t channel_idx) {
+    if (range_count <= 0 || !aicpu_prefetch_reserve_channel(channel_idx)) {
+        return;
+    }
+    for (int32_t i = 0; i < range_count; ++i) {
+        aicpu_prefetch_issue_reserved(
+            reinterpret_cast<void *>(ranges[i].addr), static_cast<size_t>(ranges[i].size), nullptr, 0, -1, channel_idx
+        );
+    }
+}
 }
 
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
@@ -141,6 +284,54 @@ void SchedulerContext::dispatch_subtask_to_core(
     deferred_ingress->error_code = PTO2_ERROR_NONE;
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_ingress);
     build_payload(payload, slot_state, subslot, async_ctx);
+    if (prefetch_mode_ == Runtime::PREFETCH_MODE_SDMA && subslot == PTO2SubtaskSlot::AIC &&
+        (sdma_prefetch_tensor_ || sdma_prefetch_instr_) && (!sdma_prefetch_pending_only_ || to_pending)) {
+        int32_t slot_idx = static_cast<int32_t>(subslot);
+        uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+        const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+        uint64_t instr_addr = 0;
+        size_t instr_size = 0;
+        if (sdma_prefetch_instr_ && callable != nullptr && payload.function_bin_addr != 0) {
+            instr_addr = payload.function_bin_addr;
+            instr_size = static_cast<size_t>(callable->binary_size());
+        }
+
+        TensorPrefetchRange tensor_ranges[PTO2_PREFETCH_TENSOR_RANGE_CAP];
+        int32_t tensor_range_count = 0;
+        PTO2TaskPayload *task_payload = slot_state.payload;
+        if (sdma_prefetch_tensor_ && task_payload != nullptr &&
+            (!sdma_prefetch_ready_ || task_payload->sdma_tensor_prefetched.load(std::memory_order_acquire) == 0)) {
+            tensor_range_count = collect_tensor_prefetch_ranges(
+                slot_state, sdma_prefetch_min_bytes_, sdma_prefetch_max_bytes_, sdma_prefetch_subview_ranges_,
+                sdma_prefetch_whole_kv_, sdma_prefetch_whole_kv_max_bytes_, sdma_prefetch_tensor_seq_, tensor_ranges
+            );
+            if (sdma_prefetch_ready_ && tensor_range_count > 0) {
+                uint8_t expected = 0;
+                if (!task_payload->sdma_tensor_prefetched.compare_exchange_strong(
+                        expected, 1, std::memory_order_acq_rel, std::memory_order_acquire
+                    )) {
+                    tensor_range_count = 0;
+                }
+            }
+        }
+
+        if (tensor_range_count > 0 || (instr_addr != 0 && instr_size != 0)) {
+            if (aicpu_prefetch_reserve_channel(core_id)) {
+                uint64_t first_addr = tensor_range_count > 0 ? tensor_ranges[0].addr : 0;
+                uint64_t first_size = tensor_range_count > 0 ? tensor_ranges[0].size : 0;
+                aicpu_prefetch_issue_reserved(
+                    reinterpret_cast<void *>(first_addr), static_cast<size_t>(first_size),
+                    reinterpret_cast<void *>(instr_addr), instr_size, slot_state.task->kernel_id[slot_idx], core_id
+                );
+                for (int32_t i = 1; i < tensor_range_count; ++i) {
+                    aicpu_prefetch_issue_reserved(
+                        reinterpret_cast<void *>(tensor_ranges[i].addr), static_cast<size_t>(tensor_ranges[i].size),
+                        nullptr, 0, -1, core_id
+                    );
+                }
+            }
+        }
+    }
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -247,6 +438,32 @@ void SchedulerContext::dispatch_shape(
         PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
         int got = pop_ready_tasks_batch(shape, thread_idx, local_buf, batch, want);
         if (got == 0) break;
+
+        if (sdma_prefetch_ready_ && prefetch_mode_ == Runtime::PREFETCH_MODE_SDMA && sdma_prefetch_tensor_ &&
+            (shape == PTO2ResourceShape::AIC || shape == PTO2ResourceShape::MIX)) {
+            for (int bi = 0; bi < got; bi++) {
+                PTO2TaskSlotState *slot_state = batch[bi];
+                if (!slot_state->active_mask.subtask_active(PTO2SubtaskSlot::AIC) ||
+                    slot_state->payload == nullptr ||
+                    slot_state->payload->sdma_tensor_prefetched.load(std::memory_order_acquire) != 0) {
+                    continue;
+                }
+                TensorPrefetchRange tensor_ranges[PTO2_PREFETCH_TENSOR_RANGE_CAP];
+                int32_t tensor_range_count = collect_tensor_prefetch_ranges(
+                    *slot_state, sdma_prefetch_min_bytes_, sdma_prefetch_max_bytes_, sdma_prefetch_subview_ranges_,
+                    sdma_prefetch_whole_kv_, sdma_prefetch_whole_kv_max_bytes_, sdma_prefetch_tensor_seq_, tensor_ranges
+                );
+                if (tensor_range_count <= 0) {
+                    continue;
+                }
+                uint8_t expected = 0;
+                if (slot_state->payload->sdma_tensor_prefetched.compare_exchange_strong(
+                        expected, 1, std::memory_order_acq_rel, std::memory_order_acquire
+                    )) {
+                    issue_tensor_prefetch_ranges(tensor_ranges, tensor_range_count, thread_idx);
+                }
+            }
+        }
 
         bool dispatched_any = false;
         for (int bi = 0; bi < got; bi++) {

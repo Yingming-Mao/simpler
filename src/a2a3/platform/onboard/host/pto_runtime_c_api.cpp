@@ -30,7 +30,9 @@
 #include "common/unified_log.h"
 #include "device_runner.h"
 #include "host_log.h"
+#include "host/host_prefetch_setup.h"
 #include "host/raii_scope_guard.h"
+#include "common/platform_config.h"
 #include "runtime.h"
 
 // Forward-declared (rather than #include "dlog_pub.h") so this TU does not
@@ -48,6 +50,8 @@ int prepare_callable_impl(
 );
 int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr);
 int validate_runtime_impl(Runtime *runtime);
+void sdma_prefetch_setup_runtime_impl(Runtime *runtime, int worker_count) __attribute__((weak));
+void sdma_prefetch_teardown_runtime_impl(Runtime *runtime) __attribute__((weak));
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding (set by prepare_callable / run_prepared, read by HostApi wrappers)
@@ -116,7 +120,10 @@ DeviceContextHandle create_device_context(void) {
     }
 }
 
-void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<DeviceRunner *>(ctx); }
+void destroy_device_context(DeviceContextHandle ctx) {
+    host_prefetch_teardown(nullptr);
+    delete static_cast<DeviceRunner *>(ctx);
+}
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
@@ -190,6 +197,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
+        host_prefetch_teardown(nullptr);
         return static_cast<DeviceRunner *>(ctx)->finalize();
     } catch (...) {
         return -1;
@@ -352,6 +360,11 @@ int run_prepared(
             return rc;
         }
 
+        if (sdma_prefetch_setup_runtime_impl != nullptr) {
+            const int worker_count = block_dim * PLATFORM_CORES_PER_BLOCKDIM;
+            sdma_prefetch_setup_runtime_impl(r, worker_count);
+        }
+
         runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
@@ -360,11 +373,17 @@ int run_prepared(
 
         rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
+            if (sdma_prefetch_teardown_runtime_impl != nullptr) {
+                sdma_prefetch_teardown_runtime_impl(r);
+            }
             validate_runtime_impl(r);
             r->~Runtime();
             return rc;
         }
 
+        if (sdma_prefetch_teardown_runtime_impl != nullptr) {
+            sdma_prefetch_teardown_runtime_impl(r);
+        }
         rc = validate_runtime_impl(r);
         r->~Runtime();
         return rc;

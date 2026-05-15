@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
+#include "aicpu/device_prefetch.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -809,6 +810,21 @@ int32_t SchedulerContext::init(
     sched_thread_num_ = sched_thread_num;
     orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
+    prefetch_mode_ = runtime->prefetch_mode;
+    sdma_prefetch_min_bytes_ = runtime->sdma_prefetch_min_bytes;
+    sdma_prefetch_max_bytes_ = runtime->sdma_prefetch_max_bytes;
+    sdma_prefetch_subview_ranges_ = runtime->sdma_prefetch_subview_ranges;
+    sdma_prefetch_tensor_ = runtime->sdma_prefetch_tensor;
+    sdma_prefetch_instr_ = runtime->sdma_prefetch_instr;
+    sdma_prefetch_ready_ = runtime->sdma_prefetch_ready;
+    sdma_prefetch_pending_only_ = runtime->sdma_prefetch_pending_only;
+    sdma_prefetch_whole_kv_ = runtime->sdma_prefetch_whole_kv;
+    sdma_prefetch_whole_kv_max_bytes_ = runtime->sdma_prefetch_whole_kv_max_bytes;
+    sdma_prefetch_debug_ = runtime->sdma_prefetch_debug;
+    sdma_prefetch_tensor_seq_.store(0, std::memory_order_relaxed);
+    aicpu_prefetch_init(
+        runtime->sdma_prefetch_workspace, runtime->sdma_prefetch_suppress_window, runtime->sdma_prefetch_debug
+    );
 
 #if PTO2_PROFILING
     if (is_l2_swimlane_enabled()) {
@@ -913,6 +929,19 @@ void SchedulerContext::deinit() {
     }
 
     regs_ = 0;
+    prefetch_mode_ = 0;
+    sdma_prefetch_min_bytes_ = 256 * 1024;
+    sdma_prefetch_max_bytes_ = 1024 * 1024;
+    sdma_prefetch_subview_ranges_ = 2;
+    sdma_prefetch_tensor_ = true;
+    sdma_prefetch_instr_ = false;
+    sdma_prefetch_ready_ = false;
+    sdma_prefetch_pending_only_ = false;
+    sdma_prefetch_whole_kv_ = false;
+    sdma_prefetch_whole_kv_max_bytes_ = 128 * 1024 * 1024;
+    sdma_prefetch_debug_ = false;
+    sdma_prefetch_tensor_seq_.store(0, std::memory_order_relaxed);
+    aicpu_prefetch_deinit();
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;

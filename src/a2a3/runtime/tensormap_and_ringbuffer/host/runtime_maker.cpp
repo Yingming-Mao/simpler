@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 
 #include "../common/pto_runtime_status.h"
 #include "../runtime/pto_shared_memory.h"
@@ -42,6 +43,8 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "prepare_callable_common.h"
+
+void* host_prefetch_setup(int channel_count) __attribute__((weak));
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -69,6 +72,136 @@ static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool requir
         return 0;
     }
     return static_cast<uint64_t>(val);
+}
+
+static uint32_t parse_prefetch_mode() {
+    const char *env_mode = std::getenv("PTO_SDMA_PREFETCH_MODE");
+    if (env_mode != nullptr && *env_mode != '\0') {
+        if (strcasecmp(env_mode, "off") == 0 || strcasecmp(env_mode, "baseline") == 0 ||
+            strcmp(env_mode, "0") == 0 || strcasecmp(env_mode, "false") == 0 ||
+            strcasecmp(env_mode, "no") == 0) {
+            return Runtime::PREFETCH_MODE_OFF;
+        }
+        if (strcasecmp(env_mode, "sdma") == 0 || strcmp(env_mode, "1") == 0 ||
+            strcasecmp(env_mode, "true") == 0 || strcasecmp(env_mode, "yes") == 0 ||
+            strcasecmp(env_mode, "on") == 0) {
+            return Runtime::PREFETCH_MODE_SDMA;
+        }
+        LOG_WARN("PTO_SDMA_PREFETCH_MODE=%s invalid, disabling SDMA prefetch", env_mode);
+        return Runtime::PREFETCH_MODE_OFF;
+    }
+
+    const char *env_enable = std::getenv("PTO_ENABLE_SDMA_PREFETCH");
+    if (env_enable == nullptr || *env_enable == '\0') {
+        return Runtime::PREFETCH_MODE_OFF;
+    }
+    if (strcmp(env_enable, "0") == 0 || strcasecmp(env_enable, "false") == 0 ||
+        strcasecmp(env_enable, "off") == 0 || strcasecmp(env_enable, "no") == 0) {
+        return Runtime::PREFETCH_MODE_OFF;
+    }
+    return Runtime::PREFETCH_MODE_SDMA;
+}
+
+static const char *prefetch_mode_name(uint32_t mode) {
+    switch (mode) {
+        case Runtime::PREFETCH_MODE_OFF:
+            return "off";
+        case Runtime::PREFETCH_MODE_SDMA:
+            return "sdma";
+        default:
+            return "unknown";
+    }
+}
+
+static uint64_t parse_prefetch_min_bytes() {
+    const char *env = std::getenv("PTO_SDMA_PREFETCH_MIN_BYTES");
+    if (env == nullptr || *env == '\0') {
+        return 256 * 1024;
+    }
+    char *endptr = nullptr;
+    errno = 0;
+    uint64_t value = strtoull(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0') {
+        LOG_WARN("PTO_SDMA_PREFETCH_MIN_BYTES=%s invalid, using default %u", env, 256 * 1024);
+        return 256 * 1024;
+    }
+    return value;
+}
+
+static uint64_t parse_prefetch_max_bytes() {
+    const char *env = std::getenv("PTO_SDMA_PREFETCH_MAX_BYTES");
+    if (env == nullptr || *env == '\0') {
+        return 1024 * 1024;
+    }
+    char *endptr = nullptr;
+    errno = 0;
+    uint64_t value = strtoull(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0') {
+        LOG_WARN("PTO_SDMA_PREFETCH_MAX_BYTES=%s invalid, using default %u", env, 1024 * 1024);
+        return 1024 * 1024;
+    }
+    return value;
+}
+
+static uint64_t parse_prefetch_whole_kv_max_bytes() {
+    const char *env = std::getenv("PTO_SDMA_PREFETCH_WHOLE_KV_MAX_BYTES");
+    if (env == nullptr || *env == '\0') {
+        return 128 * 1024 * 1024;
+    }
+    char *endptr = nullptr;
+    errno = 0;
+    uint64_t value = strtoull(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0') {
+        LOG_WARN("PTO_SDMA_PREFETCH_WHOLE_KV_MAX_BYTES=%s invalid, using default %u", env, 128 * 1024 * 1024);
+        return 128 * 1024 * 1024;
+    }
+    return value;
+}
+
+static uint32_t parse_prefetch_suppress_window() {
+    const char *env = std::getenv("PTO_SDMA_PREFETCH_SUPPRESS_WINDOW");
+    if (env == nullptr || *env == '\0') {
+        return 2;
+    }
+    char *endptr = nullptr;
+    errno = 0;
+    unsigned long value = strtoul(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0') {
+        LOG_WARN("PTO_SDMA_PREFETCH_SUPPRESS_WINDOW=%s invalid, using default %u", env, 2u);
+        return 2;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+static uint32_t parse_prefetch_subview_ranges() {
+    const char *env = std::getenv("PTO_SDMA_PREFETCH_SUBVIEW_RANGES");
+    if (env == nullptr || *env == '\0') {
+        return 2;
+    }
+    char *endptr = nullptr;
+    errno = 0;
+    unsigned long value = strtoul(env, &endptr, 10);
+    if (errno == ERANGE || endptr == env || *endptr != '\0' || value == 0 || value > 6) {
+        LOG_WARN("PTO_SDMA_PREFETCH_SUBVIEW_RANGES=%s invalid, using default %u", env, 2u);
+        return 2;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+static bool parse_prefetch_bool(const char *name, bool default_value) {
+    const char *env = std::getenv(name);
+    if (env == nullptr || *env == '\0') {
+        return default_value;
+    }
+    if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 ||
+        strcasecmp(env, "off") == 0 || strcasecmp(env, "no") == 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_prefetch_debug() {
+    return parse_prefetch_bool("PTO_SDMA_PREFETCH_DEBUG", false);
 }
 
 static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
@@ -240,6 +373,31 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
         LOG_INFO_V0("Ready queue shards: %d", runtime->ready_queue_shards);
     }
 
+    runtime->prefetch_mode = parse_prefetch_mode();
+    runtime->sdma_prefetch_min_bytes = parse_prefetch_min_bytes();
+    runtime->sdma_prefetch_max_bytes = parse_prefetch_max_bytes();
+    runtime->sdma_prefetch_subview_ranges = parse_prefetch_subview_ranges();
+    runtime->sdma_prefetch_suppress_window = parse_prefetch_suppress_window();
+    runtime->sdma_prefetch_tensor = parse_prefetch_bool("PTO_SDMA_PREFETCH_TENSOR", true);
+    runtime->sdma_prefetch_instr = parse_prefetch_bool("PTO_SDMA_PREFETCH_INSTR", false);
+    runtime->sdma_prefetch_ready = parse_prefetch_bool("PTO_SDMA_PREFETCH_READY", false);
+    runtime->sdma_prefetch_pending_only = parse_prefetch_bool("PTO_SDMA_PREFETCH_PENDING_ONLY", false);
+    runtime->sdma_prefetch_whole_kv = parse_prefetch_bool("PTO_SDMA_PREFETCH_WHOLE_KV", false);
+    runtime->sdma_prefetch_whole_kv_max_bytes = parse_prefetch_whole_kv_max_bytes();
+    runtime->sdma_prefetch_debug = parse_prefetch_debug();
+    LOG_INFO_V5("Prefetch mode: %s", prefetch_mode_name(runtime->prefetch_mode));
+    LOG_INFO_V5("SDMA prefetch min bytes: %" PRIu64, runtime->sdma_prefetch_min_bytes);
+    LOG_INFO_V5("SDMA prefetch max bytes: %" PRIu64, runtime->sdma_prefetch_max_bytes);
+    LOG_INFO_V5("SDMA prefetch subview ranges: %u", runtime->sdma_prefetch_subview_ranges);
+    LOG_INFO_V5("SDMA prefetch suppress window: %u", runtime->sdma_prefetch_suppress_window);
+    LOG_INFO_V5("SDMA prefetch tensor: %s", runtime->sdma_prefetch_tensor ? "on" : "off");
+    LOG_INFO_V5("SDMA prefetch instr: %s", runtime->sdma_prefetch_instr ? "on" : "off");
+    LOG_INFO_V5("SDMA prefetch ready: %s", runtime->sdma_prefetch_ready ? "on" : "off");
+    LOG_INFO_V5("SDMA prefetch pending only: %s", runtime->sdma_prefetch_pending_only ? "on" : "off");
+    LOG_INFO_V5("SDMA prefetch whole KV: %s", runtime->sdma_prefetch_whole_kv ? "on" : "off");
+    LOG_INFO_V5("SDMA prefetch whole KV max bytes: %" PRIu64, runtime->sdma_prefetch_whole_kv_max_bytes);
+    LOG_INFO_V5("SDMA prefetch debug: %s", runtime->sdma_prefetch_debug ? "on" : "off");
+
     // Read orchestrator-to-scheduler transition flag from environment
     {
         const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
@@ -304,6 +462,24 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
     LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;
+}
+
+extern "C" void sdma_prefetch_setup_runtime_impl(Runtime *runtime, int worker_count) {
+    if (runtime == nullptr || runtime->prefetch_mode != Runtime::PREFETCH_MODE_SDMA) {
+        return;
+    }
+    if (host_prefetch_setup == nullptr) {
+        LOG_INFO_V5("SDMA prefetch setup unavailable on this platform");
+        return;
+    }
+    runtime->sdma_prefetch_workspace = host_prefetch_setup(worker_count);
+}
+
+extern "C" void sdma_prefetch_teardown_runtime_impl(Runtime *runtime) {
+    if (runtime == nullptr || runtime->sdma_prefetch_workspace == nullptr) {
+        return;
+    }
+    runtime->sdma_prefetch_workspace = nullptr;
 }
 
 /**
